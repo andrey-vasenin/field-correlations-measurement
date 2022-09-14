@@ -10,10 +10,19 @@
 #include <complex>
 #include <cufft.h>
 #include <cublas_v2.h>
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
 
 const int num_streams = 4;
 const int cal_mat_size = 16;
 const int cal_mat_side = 4;
+
+typedef thrust::device_vector<Npp32f> gpuvec;
+template <typename T>
+inline T* get(thrust::device_vector<T> vec)
+{
+    return thrust::raw_pointer_cast(&vec[0]);
+}
 
 class dsp {
     /* Pointer */
