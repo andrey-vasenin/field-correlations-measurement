@@ -348,3 +348,12 @@ MigrationBackup/
 
 # Ionide (cross platform F# VS Code tools) working folder
 .ionide/
+
+install_module.bat
+launch_script.bat
+plot_results.bat
+plot_results.py
+__init__.py
+script.py
+old/
+c_header
