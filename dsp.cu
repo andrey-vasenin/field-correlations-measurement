@@ -16,94 +16,84 @@
 #include <cublas_v2.h>
 #include <cmath>
 
+inline void check_cufft_error(cufftResult cufft_err, std::string &&msg)
+{
+    if (cufft_err != CUFFT_SUCCESS)
+        throw std::runtime_error(msg);
+}
+
+inline void check_cublas_error(cublasStatus_t err, std::string &&msg)
+{
+    if (err != CUBLAS_STATUS_SUCCESS)
+        throw std::runtime_error(msg);
+}
+
+inline void check_npp_error(NppStatus err, std::string &&msg)
+{
+    if (err != NPP_SUCCESS)
+        throw std::runtime_error(msg);
+}
 
 // DSP constructor
-dsp::dsp(int len, int n, float part)
+dsp::dsp(int len, int n, float part) : trace_length{(int)std::round((float)len * part)}, // Length of a signal or noise trace
+                                       batch_size{n},                                    // Number of segments in a buffer (same: number of traces in data)
+                                       total_length{batch_size * trace_length},
+                                       out_size{trace_length * trace_length},
+                                       trace1_start{0},       // Start of the signal data
+                                       trace2_start{len / 2}, // Start of the noise data
+                                       pitch{len},            // Segment length in a buffer
+                                       A_gpu(2 * total_length), C_gpu(total_length),
+                                       firwin(total_length), // GPU memory for the filtering window
+                                       subtraction_trace(total_length, std::complex(0.f)),
+                                       downconversion_coeffs(total_length)
 {
-    trace_length = (int)std::round((float)len * part); // Length of a signal or noise trace
-    batch_size = n; // Number of segments in a buffer (same: number of traces in data)
-    total_length = batch_size * trace_length;
-    //out_size = trace_length * (trace_length + 1) / 2;
-    out_size = trace_length * trace_length;
-
-    trace1_start = 0; // Start of the signal data
-    trace2_start = len / 2; // Start of the noise data
-    pitch = len; // Segment length in a buffer
-
-    // allocating down-conversion calibration vectors
-    this->handleError(cudaMalloc(&A_gpu, 2 * total_length * sizeof(float)));
-    this->handleError(cudaMalloc(&C_gpu, total_length * sizeof(Npp32fc)));
-
     // Streams
     for (int i = 0; i < num_streams; i++)
     {
         // Create streams for parallel data processing
-        this->handleError(cudaStreamCreateWithFlags(&streams[i], cudaStreamNonBlocking));
-        auto nppStatus = nppGetStreamContext(&streamContexts[i]);
-        if (nppStatus != NPP_SUCCESS)
-            throw std::runtime_error("Couldn't get stream context");
+        handleError(cudaStreamCreateWithFlags(&streams[i], cudaStreamNonBlocking));
+        check_npp_error(nppGetStreamContext(&streamContexts[i]), "Npp Error GetStreamContext");
         streamContexts[i].hStream = streams[i];
 
         // Allocate arrays on GPU for every stream
-        gpu_buf[i] = nppsMalloc_8s(2 * total_length);
-        gpu_buf2[i] = nppsMalloc_8s(2 * total_length);
-        data[i] = nppsMalloc_32f(2 * total_length);
-        noise[i] = nppsMalloc_32f(2 * total_length);
-        data_calibrated[i] = nppsMalloc_32f(2 * total_length);
-        noise_calibrated[i] = nppsMalloc_32f(2 * total_length);
-        power[i] = nppsMalloc_32f(2 * total_length);
-        field[i] = nppsMalloc_32f(2 * total_length);
-        out[i] = nppsMalloc_32fc(out_size);
-
-        // Initialize the result arrays with zeros
-        nppsSet_32f(0.f, field[i], 2 * total_length);
-        nppsSet_32f(0.f, power[i], 2 * total_length);
-        nppsSet_32fc(Npp32fc{0.f, 0.f}, out[i], out_size);
+        gpu_buf[i].resize(2 * total_length);
+        gpu_buf2[i].resize(2 * total_length);
+        data[i].resize(2 * total_length);
+        noise[i].resize(2 * total_length);
+        data_calibrated[i].resize(2 * total_length);
+        noise_calibrated[i].resize(2 * total_length);
+        power[i].resize(2 * total_length);
+        field[i].resize(2 * total_length);
+        out[i].resize(out_size);
 
         // Initialize cuFFT plans
-        auto cufft_err = cufftPlan1d(&plans[i], trace_length, CUFFT_C2C, batch_size);
-        if (cufft_err != CUFFT_SUCCESS)
-            throw std::runtime_error("Error initializing cuFFT plan\n");
+        check_cufft_error(cufftPlan1d(&plans[i], trace_length, CUFFT_C2C, batch_size),
+                          "Error initializing cuFFT plan\n");
 
         // Assign streams to cuFFT plans
-        cufft_err = cufftSetStream(plans[i], streams[i]);
-        if (cufft_err != CUFFT_SUCCESS)
-            throw std::runtime_error("Error assigning a stream to a cuFFT plan\n");
+        check_cufft_error(cufftSetStream(plans[i], streams[i]),
+                          "Error assigning a stream to a cuFFT plan\n");
 
         // Initialize cuBLAS
-        auto cublas_err = cublasCreate(&cublas_handles[i]);
-        if (cublas_err != CUBLAS_STATUS_SUCCESS)
-            throw std::runtime_error("Error initializing a cuBLAS handle\n");
-        
-        cublas_err = cublasCreate(&cublas_handles2[i]);
-        if (cublas_err != CUBLAS_STATUS_SUCCESS)
-            throw std::runtime_error("Error initializing a cuBLAS handle\n");
+        check_cublas_error(cublasCreate(&cublas_handles[i]),
+                           "Error initializing a cuBLAS handle\n");
+        check_cublas_error(cublasCreate(&cublas_handles2[i]),
+                           "Error initializing a cuBLAS handle\n");
 
         // Assign streams to cuBLAS handles
-        cublas_err = cublasSetStream(cublas_handles[i], streams[i]);
-        if (cublas_err != CUBLAS_STATUS_SUCCESS)
-            throw std::runtime_error("Error assigning a stream to a cuBLAS handle\n");
-        cublas_err = cublasSetStream(cublas_handles2[i], streams[i]);
-        if (cublas_err != CUBLAS_STATUS_SUCCESS)
-            throw std::runtime_error("Error assigning a stream to a cuBLAS handle\n");
+        check_cublas_error(cublasSetStream(cublas_handles[i], streams[i]),
+                           "Error assigning a stream to a cuBLAS handle\n");
+        check_cublas_error(cublasSetStream(cublas_handles2[i], streams[i]),
+                           "Error assigning a stream to a cuBLAS handle\n");
     }
-    // Allocate GPU memory for the filtering window
-    firwin = nppsMalloc_32fc(total_length);
+    resetOutput();
 
     // Allocate GPU memory for the minmax function
-    cudaMalloc((void**)(&minfield), sizeof(Npp32f) * 1);
-    cudaMalloc((void**)(&maxfield), sizeof(Npp32f) * 1);
+    cudaMalloc((void **)(&minfield), sizeof(Npp32f) * 1);
+    cudaMalloc((void **)(&maxfield), sizeof(Npp32f) * 1);
     int nBufferSize;
     nppsMinMaxGetBufferSize_32f(2 * total_length, &nBufferSize);
-    cudaMalloc((void**)(&minmaxbuffer), nBufferSize);
-
-    // Allocate GPU memory for the subtraction trace
-    subtraction_trace = nppsMalloc_32fc(total_length);
-    Npp32fc initval{ 0, 0 };
-    nppsSet_32fc(initval, subtraction_trace, total_length);
-
-    // Allocate GPU memory for the downconversion coefficients
-    downconversion_coeffs = nppsMalloc_32fc(total_length);
+    cudaMalloc((void **)(&minmaxbuffer), nBufferSize);
 }
 
 // DSP destructor
@@ -119,35 +109,12 @@ dsp::~dsp()
         cufftDestroy(plans[i]);
 
         // Destroy GPU streams
-        this->handleError(cudaStreamDestroy(streams[i]));
-
-        // Free GPU memory
-        nppsFree(data[i]);
-        nppsFree(data_complex[i]);
-        nppsFree(data_calibrated[i]);
-        nppsFree(gpu_buf[i]);
-        nppsFree(power[i]);
-        nppsFree(field[i]);
-        nppsFree(out[i]);
-        if (gpu_buf2[i] != nullptr)
-            nppsFree(gpu_buf2[i]);
-        if (noise[i] != nullptr)
-            nppsFree(noise[i]);
-        if (noise_calibrated[i] != nullptr)
-            nppsFree(noise_calibrated[i]);
+        handleError(cudaStreamDestroy(streams[i]));
     }
-    nppsFree(firwin);
-    cudaFree(A_gpu);
-    cudaFree(C_gpu);
 
     cudaFree(minfield);
     cudaFree(maxfield);
     cudaFree(minmaxbuffer);
-
-    nppsFree(subtraction_trace);
-    nppsFree(downconversion_coeffs);
-
-    this->deleteBuffer();
 
     cudaDeviceReset();
 }
@@ -156,18 +123,16 @@ dsp::~dsp()
 void dsp::setFirwin(float cutoff_l, float cutoff_r, int oversampling)
 {
     using namespace std::complex_literals;
-    auto hFirwin = new std::complex<float>[total_length];
+    hostvec_c hFirwin(total_length);
     float fs = 1250.f / (float)oversampling;
     int l_idx = (int)std::roundf((float)trace_length / fs * cutoff_l);
-    int r_idx = (int)std::roundf((float)trace_length / fs * cutoff_r);;
+    int r_idx = (int)std::roundf((float)trace_length / fs * cutoff_r);
     for (int i = 0; i < total_length; i++)
     {
         int j = i % trace_length;
         hFirwin[i] = ((j < l_idx) || (j > r_idx)) ? 0if : 1.0f + 0if;
     }
-    this->handleError(cudaMemcpy((void*)firwin, (void*)hFirwin,
-        total_length * sizeof(hFirwin), cudaMemcpyHostToDevice));
-    delete[] hFirwin;
+    firwin = hFirwin;
 }
 
 // Initializes matrices and arrays required for down-conversion calibration with given parameters
@@ -177,7 +142,7 @@ void dsp::setDownConversionCalibrationParameters(float r, float phi, float offse
     float a_ii = 1;
     float a_qi = std::tan(phi);
     float a_qq = 1 / (r * std::cos(phi));
-    float A_mat[cal_mat_size];
+    hostvec A_mat(cal_mat_size);
     if (cal_mat_size == 4)
     {
         A_mat[0] = a_ii;
@@ -198,21 +163,19 @@ void dsp::setDownConversionCalibrationParameters(float r, float phi, float offse
     }
 
     // Creating an array with repeated matrices
-    std::vector<float> A_host(2 * total_length);
+    hostvec A_host(2 * total_length);
     for (int i = 0; i < 2 * total_length; i += cal_mat_size)
         for (int j = 0; j < cal_mat_size; j++)
             A_host[i + j] = A_mat[j];
 
     // Transferring it onto GPU memory
-    this->handleError(cudaMemcpyAsync(A_gpu, A_host.data(), A_host.size() * sizeof(float),
-        cudaMemcpyHostToDevice, streams[0]));
+    A_gpu = A_host;
 
     // Estimating the number of matrix multiplications
     batch_count = 2 * total_length / cal_mat_size;
 
     // Filling the offsets array C_gpu
-    Npp32fc init_val{ offset_i, offset_q };
-    nppsSet_32fc(init_val, C_gpu, total_length);
+    thrust::fill(C_gpu.begin(), C_gpu.end(), Npp32fc{offset_i, offset_q});
 
     // cleaning
     cudaDeviceSynchronize();
@@ -229,16 +192,16 @@ void dsp::handleError(cudaError_t err)
     }
 }
 
-void dsp::createBuffer(size_t size)
+void dsp::createBuffer(uint32_t size)
 {
-    this->handleError(cudaMallocHost((void**)&buffer, size));
+    buffer.resize(size);
 }
 
 void dsp::setIntermediateFrequency(float frequency, int oversampling)
 {
     using namespace std::complex_literals;
-    std::vector<std::complex<float>> dcov_host(total_length);
-    
+    hostvec_c dcov_host(total_length);
+
     const float pi = std::acos(-1);
 
     float ovs = static_cast<float>(oversampling);
@@ -249,127 +212,113 @@ void dsp::setIntermediateFrequency(float frequency, int oversampling)
         for (int k = 0; k < trace_length; k++)
         {
             t = 0.8 * k * ovs;
-            dcov_host[j * trace_length + k] = std::exp(-2if * pi* frequency* t);
+            dcov_host[j * trace_length + k] = std::exp(-2if * pi * frequency * t);
         }
     }
-    this->handleError(cudaMemcpy(reinterpret_cast<void*>(downconversion_coeffs),
-        reinterpret_cast<void*>(dcov_host.data()),
-        total_length * sizeof(Npp32fc), cudaMemcpyHostToDevice));
+    downconversion_coeffs = dcov_host;
 }
 
-char* dsp::getBufferPointer()
+char *dsp::getBufferPointer()
 {
-    return buffer;
-}
-
-void dsp::deleteBuffer()
-{
-    this->handleError(cudaFreeHost(buffer));
+    return &buffer[0];
 }
 
 // Fills with zeros the arrays for cumulative field and power in the GPU memory
 void dsp::resetOutput()
 {
+    using namespace std::complex_literals;
     for (int i = 0; i < num_streams; i++)
     {
-        nppsSet_32fc(Npp32fc{ 0.f , 0.f}, out[i], out_size);
-        nppsSet_32f(0.f, field[i], 2 * total_length);
-        nppsSet_32f(0.f, power[i], 2 * total_length);
+        thrust::fill(out[i].begin(), out[i].end(), 0if);
+        thrust::fill(field[i].begin(), field[i].end(), 0.f);
+        thrust::fill(power[i].begin(), power[i].end(), 0.f);
     }
 }
 
-void dsp::downconvert(Npp32fc* data, int stream_num)
+void dsp::downconvert(gpuvec data, int stream_num)
 {
-    nppsMul_32fc_I_Ctx(downconversion_coeffs, data, total_length, streamContexts[stream_num]);
+    nppsMul_32fc_I_Ctx(get(downconversion_coeffs), get(data), total_length, streamContexts[stream_num]);
 }
 
-void dsp::compute(const char* buffer)
+void dsp::compute(const hostbuf &buffer)
 {
     const int stream_num = semaphore;
-    this->switchStream();
-    this->loadDataToGPUwithPitchAndOffset(buffer, gpu_buf[stream_num], pitch, trace1_start, stream_num);
-    this->loadDataToGPUwithPitchAndOffset(buffer, gpu_buf2[stream_num], pitch, trace2_start, stream_num);
-    this->convertDataToMilivolts(data[stream_num], gpu_buf[stream_num], stream_num);
-    this->convertDataToMilivolts(noise[stream_num], gpu_buf2[stream_num], stream_num);
-    this->applyDownConversionCalibration(data[stream_num], data_calibrated[stream_num], stream_num);
-    this->applyDownConversionCalibration(noise[stream_num], noise_calibrated[stream_num], stream_num);
-    this->applyFilter(reinterpret_cast<Npp32fc*>(data_calibrated[stream_num]), firwin, stream_num);
-    this->applyFilter(reinterpret_cast<Npp32fc*>(noise_calibrated[stream_num]), firwin, stream_num);
-    this->downconvert(reinterpret_cast<Npp32fc*>(data_calibrated[stream_num]), stream_num);
-    this->downconvert(reinterpret_cast<Npp32fc*>(noise_calibrated[stream_num]), stream_num);
-    this->subtractDataFromOutput(reinterpret_cast<Npp32f*>(subtraction_trace), data_calibrated[stream_num], stream_num);
-    
-    this->calculateField(stream_num);
-    this->calculateG1(stream_num);
-    this->calculatePower(stream_num);
+    switchStream();
+    loadDataToGPUwithPitchAndOffset(buffer, gpu_buf[stream_num], pitch, trace1_start, stream_num);
+    loadDataToGPUwithPitchAndOffset(buffer, gpu_buf2[stream_num], pitch, trace2_start, stream_num);
+    convertDataToMilivolts(data[stream_num], gpu_buf[stream_num], stream_num);
+    convertDataToMilivolts(noise[stream_num], gpu_buf2[stream_num], stream_num);
+    applyDownConversionCalibration(data[stream_num], data_calibrated[stream_num], stream_num);
+    applyDownConversionCalibration(noise[stream_num], noise_calibrated[stream_num], stream_num);
+    applyFilter(data_calibrated[stream_num], firwin, stream_num);
+    applyFilter(noise_calibrated[stream_num], firwin, stream_num);
+    downconvert(data_calibrated[stream_num], stream_num);
+    downconvert(noise_calibrated[stream_num], stream_num);
+    subtractDataFromOutput(subtraction_trace, data_calibrated[stream_num], stream_num);
+
+    calculateField(stream_num);
+    calculateG1(stream_num);
+    calculatePower(stream_num);
 }
 
 // This function uploads data from the specified section of a buffer array to the GPU memory
 void dsp::loadDataToGPUwithPitchAndOffset(
-    const char* buffer, Npp8s* gpu_buf,
+    const hostbuf &buffer, gpubuf &gpu_buf,
     size_t pitch, size_t offset, int stream_num)
 {
     size_t width = 2 * size_t(trace_length) * sizeof(Npp8s);
     size_t src_pitch = 2 * pitch * sizeof(Npp8s);
     size_t dst_pitch = width;
     size_t shift = 2 * offset;
-    auto err = cudaMemcpy2DAsync(gpu_buf, dst_pitch,
-        buffer + shift, src_pitch, width, batch_size,
-        cudaMemcpyHostToDevice, streams[stream_num]);
-    this->handleError(err);
+    handleError(cudaMemcpy2DAsync(get(gpu_buf), dst_pitch,
+                                  get(buffer) + shift, src_pitch, width, batch_size,
+                                  cudaMemcpyHostToDevice, streams[stream_num]));
 }
 
 // Converts bytes into 32-bit floats with mV dimensionality
-void dsp::convertDataToMilivolts(Npp32f* data, Npp8s* gpu_buf, int stream_num)
+void dsp::convertDataToMilivolts(gpuvec data, gpubuf gpu_buf, int stream_num)
 {
     // convert from int8 to float32
-    auto status = nppsConvert_8s32f_Ctx(gpu_buf, data,
-        2 * total_length, streamContexts[stream_num]);
-    if (status != NPP_SUCCESS)
-    {
-        throw std::runtime_error("error converting int8 to float32 #" + std::to_string(status));
-    }
-    // reinterpret interleaved channel samples as interleaved real and imaginary floats (basically do nothing)
-    data_complex[stream_num] = reinterpret_cast<Npp32fc*>(data);
+    check_npp_error(nppsConvert_8s32f_Ctx(get(gpu_buf), get(data),
+                                          2 * total_length, streamContexts[stream_num]),
+                    "error converting int8 to float32");
     // multiply by a constant in order to convert into mV
-    status = nppsMulC_32fc_I_Ctx(scale, data_complex[stream_num], total_length, streamContexts[stream_num]);
-    if (status != NPP_SUCCESS)
-    {
-        throw std::runtime_error("error when scaling to mV #" + std::to_string(status));
-    }
+    check_npp_error(nppsMulC_32fc_I_Ctx(scale, reinterpret_cast<Npp32fc *>(get(data)), total_length, streamContexts[stream_num]),
+                    "error when scaling to mV");
 }
 
 // Applies down-conversion calibration to traces
-void dsp::applyDownConversionCalibration(Npp32f* data, Npp32f* data_calibrated, int stream_num)
+void dsp::applyDownConversionCalibration(gpuvec data, gpuvec data_calibrated, int stream_num)
 {
     // Subtract offsets
-    nppsSub_32fc_I_Ctx(C_gpu, data_complex[stream_num], total_length, streamContexts[stream_num]);
+    nppsSub_32f_I_Ctx(reinterpret_cast<float*>(get(C_gpu)), get(data), 2 * total_length, streamContexts[stream_num]);
 
     // Apply rotation
-    cublasGemmStridedBatchedEx(cublas_handles[stream_num],
-        CUBLAS_OP_N,
-        CUBLAS_OP_N,
-        cal_mat_side, cal_mat_side, cal_mat_side,
-        &alpha,
-        A_gpu, CUDA_R_32F, cal_mat_side, cal_mat_size,
-        reinterpret_cast<float*>(data), CUDA_R_32F, cal_mat_side, cal_mat_size,
-        &beta,
-        reinterpret_cast<float*>(data_calibrated), CUDA_R_32F, cal_mat_side,
-        cal_mat_size,
-        batch_count,
-        CUBLAS_COMPUTE_32F_FAST_TF32,
-        //                              CUBLAS_GEMM_ALGO13_TENSOR_OP);
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    check_cublas_error(cublasGemmStridedBatchedEx(cublas_handles[stream_num],
+                                                  CUBLAS_OP_N,
+                                                  CUBLAS_OP_N,
+                                                  cal_mat_side, cal_mat_side, cal_mat_side,
+                                                  &alpha,
+                                                  A_gpu, CUDA_R_32F, cal_mat_side, cal_mat_size,
+                                                  get(data), CUDA_R_32F, cal_mat_side, cal_mat_size,
+                                                  &beta,
+                                                  get(data_calibrated), CUDA_R_32F, cal_mat_side,
+                                                  cal_mat_size,
+                                                  batch_count,
+                                                  CUBLAS_COMPUTE_32F_FAST_TF32,
+                                                  //                              CUBLAS_GEMM_ALGO13_TENSOR_OP);
+                                                  CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                       "cublas error in applyDownConversionCalibration");
 }
 
 // Applies the filter with the specified window to the data using FFT convolution
-void dsp::applyFilter(Npp32fc* data, const Npp32fc* window, int stream_num)
+void dsp::applyFilter(gpuvec data, const gpuvec window, int stream_num)
 {
     // Step 1. Take FFT of each segment
-    cufftComplex* cufft_data = reinterpret_cast<cufftComplex*>(data);
+    cufftComplex *cufft_data = reinterpret_cast<cufftComplex *>(get(data));
     cufftExecC2C(plans[stream_num], cufft_data, cufft_data, CUFFT_FORWARD);
     // Step 2. Multiply each segment by a window
-    auto npp_status = nppsMul_32fc_I_Ctx(window, data, total_length, streamContexts[stream_num]);
+    auto npp_status = nppsMul_32fc_I_Ctx(get(window), get(data), total_length, streamContexts[stream_num]);
     if (npp_status != NPP_SUCCESS)
     {
         throw std::runtime_error("Error multiplying by window #" + std::to_string(npp_status));
@@ -380,14 +329,14 @@ void dsp::applyFilter(Npp32fc* data, const Npp32fc* window, int stream_num)
     Npp32fc denominator;
     denominator.re = (Npp32f)trace_length;
     denominator.im = 0.f;
-    nppsDivC_32fc_I_Ctx(denominator, data, total_length, streamContexts[stream_num]);
+    nppsDivC_32fc_I_Ctx(denominator, get(data), total_length, streamContexts[stream_num]);
 }
 
 // Sums newly processed data with previous data for averaging
-void dsp::addDataToOutput(Npp32f* data, Npp32f* output, int stream_num)
+void dsp::addDataToOutput(Npp32f *data, Npp32f *output, int stream_num)
 {
     auto status = nppsAdd_32f_I_Ctx(data, output,
-        2 * total_length, streamContexts[stream_num]);
+                                    2 * total_length, streamContexts[stream_num]);
     if (status != NPP_SUCCESS)
     {
         throw std::runtime_error("Error adding new data to previous #" + std::to_string(status));
@@ -395,10 +344,10 @@ void dsp::addDataToOutput(Npp32f* data, Npp32f* output, int stream_num)
 }
 
 // Subtracts newly processed data from previous data
-void dsp::subtractDataFromOutput(Npp32f* data, Npp32f* output, int stream_num)
+void dsp::subtractDataFromOutput(Npp32f *data, Npp32f *output, int stream_num)
 {
     auto status = nppsSub_32f_I_Ctx(data, output,
-        2 * total_length, streamContexts[stream_num]);
+                                    2 * total_length, streamContexts[stream_num]);
     if (status != NPP_SUCCESS)
     {
         throw std::runtime_error("Error adding new data to previous #" + std::to_string(status));
@@ -440,61 +389,59 @@ void dsp::calculateG1(int stream_num)
 {
     using namespace std::string_literals;
 
-    const float alpha_data = 1;  // this alpha multiplies the result to be added to the output
-    const float alpha_noise = -1;  // this alpha multiplies the result to be added to the output
+    const float alpha_data = 1;   // this alpha multiplies the result to be added to the output
+    const float alpha_noise = -1; // this alpha multiplies the result to be added to the output
     const float beta = 1;
     // Compute correlation for the signal and add it to the output
     auto cublas_status = cublasCherk(cublas_handles2[stream_num],
-        CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N, trace_length, batch_size,
-        &alpha_data, reinterpret_cast<cuComplex*>(data_calibrated[stream_num]), trace_length,
-        &beta, reinterpret_cast<cuComplex*>(out[stream_num]), trace_length);
+                                     CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N, trace_length, batch_size,
+                                     &alpha_data, reinterpret_cast<cuComplex *>(data_calibrated[stream_num]), trace_length,
+                                     &beta, reinterpret_cast<cuComplex *>(out[stream_num]), trace_length);
     // Check for errors
     if (cublas_status != CUBLAS_STATUS_SUCCESS)
     {
-        throw std::runtime_error("Error of rank-1 update (data) with code #"s
-            + std::to_string(cublas_status));
+        throw std::runtime_error("Error of rank-1 update (data) with code #"s + std::to_string(cublas_status));
     }
     // Compute correlation for the noise and subtract it from the output
     cublas_status = cublasCherk(cublas_handles2[stream_num],
-        CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N, trace_length, batch_size,
-        &alpha_noise, reinterpret_cast<cuComplex*>(noise_calibrated[stream_num]), trace_length,
-        &beta, reinterpret_cast<cuComplex*>(out[stream_num]), trace_length);
+                                CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N, trace_length, batch_size,
+                                &alpha_noise, reinterpret_cast<cuComplex *>(noise_calibrated[stream_num]), trace_length,
+                                &beta, reinterpret_cast<cuComplex *>(out[stream_num]), trace_length);
     // Check for errors
     if (cublas_status != CUBLAS_STATUS_SUCCESS)
     {
-        throw std::runtime_error("Error of rank-1 update (noise) with code #"s
-            + std::to_string(cublas_status));
+        throw std::runtime_error("Error of rank-1 update (noise) with code #"s + std::to_string(cublas_status));
     }
 }
 
 // Returns the average value
-void dsp::getCorrelator(std::vector <std::complex<float>>& result)
+void dsp::getCorrelator(std::vector<std::complex<float>> &result)
 {
     this->handleError(cudaDeviceSynchronize());
     for (int i = 1; i < num_streams; i++)
         nppsAdd_32fc_I(out[i], out[0], out_size);
     this->handleError(cudaMemcpy(result.data(), out[0],
-        out_size * sizeof(Npp32fc), cudaMemcpyDeviceToHost));
+                                 out_size * sizeof(Npp32fc), cudaMemcpyDeviceToHost));
 }
 
 // Returns the cumulative power
-void dsp::getCumulativePower(std::vector <std::complex<float>>& result)
+void dsp::getCumulativePower(std::vector<std::complex<float>> &result)
 {
     this->handleError(cudaDeviceSynchronize());
     for (int i = 1; i < num_streams; i++)
         nppsAdd_32f_I(power[i], power[0], 2 * total_length);
     this->handleError(cudaMemcpy(result.data(), power[0],
-        2 * total_length * sizeof(Npp32f), cudaMemcpyDeviceToHost));
+                                 2 * total_length * sizeof(Npp32f), cudaMemcpyDeviceToHost));
 }
 
 // Returns the cumulative field
-void dsp::getCumulativeField(std::vector <std::complex<float>>& result)
+void dsp::getCumulativeField(std::vector<std::complex<float>> &result)
 {
     this->handleError(cudaDeviceSynchronize());
     for (int i = 1; i < num_streams; i++)
         nppsAdd_32f_I(field[i], field[0], 2 * total_length);
     this->handleError(cudaMemcpy(result.data(), field[0],
-        2 * total_length * sizeof(Npp32f), cudaMemcpyDeviceToHost));
+                                 2 * total_length * sizeof(Npp32f), cudaMemcpyDeviceToHost));
 }
 
 // Returns the useful length of the data in a segment
@@ -517,29 +464,29 @@ int dsp::getOutSize()
 }
 
 // Get mininimal and maximal values from an array for the debug purposes
-void dsp::getMinMax(Npp32f* data, int stream_num)
+void dsp::getMinMax(Npp32f *data, int stream_num)
 {
     nppsMinMax_32f_Ctx(data, 2 * total_length, minfield, maxfield, minmaxbuffer, streamContexts[stream_num]);
 }
 
 void dsp::setAmplitude(int ampl)
 {
-    scale = Npp32fc{ static_cast<float>(ampl) / 128.f, 0.f };
+    scale = Npp32fc{static_cast<float>(ampl) / 128.f, 0.f};
 }
 
-void dsp::setSubtractionTrace(std::vector<std::complex<float>>& trace)
+void dsp::setSubtractionTrace(std::vector<std::complex<float>> &trace)
 {
-    this->handleError(cudaMemcpy((void*)subtraction_trace, (void*)trace.data(),
-        total_length * sizeof(Npp32fc), cudaMemcpyHostToDevice));
+    this->handleError(cudaMemcpy((void *)subtraction_trace, (void *)trace.data(),
+                                 total_length * sizeof(Npp32fc), cudaMemcpyHostToDevice));
 }
 
-void dsp::getSubtractionTrace(std::vector<std::complex<float>>& trace)
+void dsp::getSubtractionTrace(std::vector<std::complex<float>> &trace)
 {
-    this->handleError(cudaMemcpy((void*)trace.data(), (void*)subtraction_trace,
-        total_length * sizeof(Npp32fc), cudaMemcpyDeviceToHost));
+    this->handleError(cudaMemcpy((void *)trace.data(), (void *)subtraction_trace,
+                                 total_length * sizeof(Npp32fc), cudaMemcpyDeviceToHost));
 }
 
 void dsp::resetSubtractionTrace()
 {
-    nppsSet_32fc(Npp32fc{ 0.f, 0.f }, subtraction_trace, total_length);
+    nppsSet_32fc(Npp32fc{0.f, 0.f}, subtraction_trace, total_length);
 }

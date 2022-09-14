@@ -4,7 +4,8 @@
             "name": "Linux",
             "includePath": [
                 "${workspaceFolder}/**",
-                "/mnt/labiks_c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.2/include"
+                "/mnt/labiks_c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.2/include",
+                "/mnt/labiks/CppMeasurement"
             ],
             "defines": [],
             "compilerPath": "/usr/bin/gcc",
