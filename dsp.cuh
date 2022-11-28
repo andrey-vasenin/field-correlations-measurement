@@ -19,10 +19,10 @@ const int cal_mat_side = 4;
 
 typedef thrust::device_vector<float> gpuvec;
 typedef thrust::host_vector<float> hostvec;
-typedef thrust::device_vector<std::complex<float> > gpuvec_c;
+typedef thrust::device_vector<std::complex<float>> gpuvec_c;
 typedef thrust::host_vector<std::complex<float>> hostvec_c;
 typedef thrust::device_vector<Npp8s> gpubuf;
-typedef thrust::host_vector<Npp8s,thrust::cuda::experimental::pinned_allocator<Npp8s>> hostbuf;
+typedef thrust::host_vector<Npp8s, thrust::cuda::experimental::pinned_allocator<Npp8s>> hostbuf;
 
 template <typename T>
 inline T *get(thrust::device_vector<T> vec)
@@ -38,14 +38,13 @@ class dsp
     /* Pointers to arrays with data */
     gpubuf gpu_buf[num_streams];  // buffers for loading data
     gpubuf gpu_buf2[num_streams]; // buffers for loading data
-    gpuvec data[num_streams];
-    gpuvec data_calibrated[num_streams];
-    gpuvec noise[num_streams];
-    gpuvec noise_calibrated[num_streams];
-    gpuvec_c data_complex[num_streams];
+    gpuvec_c data[num_streams];
+    gpuvec_c data_calibrated[num_streams];
+    gpuvec_c noise[num_streams];
+    gpuvec_c noise_calibrated[num_streams];
 
-    gpuvec power[num_streams]; // arrays for storage of average power
-    gpuvec field[num_streams]; // arrays for storage of average field
+    gpuvec power[num_streams];   // arrays for storage of average power
+    gpuvec_c field[num_streams]; // arrays for storage of average field
     gpuvec_c out[num_streams];
 
     int cnt = 0;
@@ -92,6 +91,8 @@ private:
     int batch_count;
     float alpha = 1.f;
     float beta = 0.f;
+
+    float a_ii, a_qi, a_qq, c_i, c_q;
 
 public:
     dsp(int len, int n, float part);
@@ -153,11 +154,11 @@ protected:
 
     void loadDataToGPUwithPitchAndOffset(const char *buffer, Npp8s *gpu_buf, size_t pitch, size_t offset, int stream_num);
 
-    void convertDataToMilivolts(gpuvec data, gpubuf gpu_buf, int stream_num);
+    void convertDataToMilivolts(gpuvec_c data, gpubuf gpu_buf, int stream_num);
 
-    void downconvert(Npp32fc *data, int stream_num);
+    void downconvert(gpuvec_c data, int stream_num);
 
-    void applyDownConversionCalibration(Npp32f *data, Npp32f *data_calibrated, int stream_num);
+    void applyDownConversionCalibration(gpuvec_c &data, gpuvec_c &data_calibrated, int stream_num);
 
     void addDataToOutput(Npp32f *data, Npp32f *output, int stream_num);
 

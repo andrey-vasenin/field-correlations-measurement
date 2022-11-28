@@ -1,4 +1,4 @@
-﻿//
+//
 // Created by andrei on 3/27/21.
 //
 
@@ -181,6 +181,36 @@ void dsp::setDownConversionCalibrationParameters(float r, float phi, float offse
     cudaDeviceSynchronize();
 }
 
+typedef thrust::complex<float> tcf;
+struct downconv_functor : thrust::unary_function<tcf, tcf>
+{
+    float a_ii, a_qi, a_qq;
+    float c_i, c_q;
+
+    downconv_functor(float _a_qi, float _a_qq,
+                     float _c_i, float _c_q) : a_ii{_a_ii}, a_qi{_a_qi},
+                                               a_qq{_a_qq},
+                                               c_i{_c_i}, c_q{_c_q}
+    {
+    }
+
+    __host__ __device__ float operator()(tcf x)
+    {
+        return tcf(a_ii * x.real() + c_i,
+                   a_qi * x.real() + a_qq * x.imag() + c_q);
+    }
+};
+
+void dsp::setDownConversionCalibrationParameters(float r, float phi,
+                                                 float offset_i, float offset_q)
+{
+    a_ii = 1;
+    a_qi = std::tan(phi);
+    a_qq = 1 / (r * std::cos(phi));
+    c_i = offset_i;
+    c_q = offset_q;
+}
+
 // Error handler
 void dsp::handleError(cudaError_t err)
 {
@@ -288,27 +318,10 @@ void dsp::convertDataToMilivolts(gpuvec data, gpubuf gpu_buf, int stream_num)
 }
 
 // Applies down-conversion calibration to traces
-void dsp::applyDownConversionCalibration(gpuvec data, gpuvec data_calibrated, int stream_num)
+void dsp::applyDownConversionCalibration(gpuvec_c &data, gpuvec_c &data_calibrated, int stream_num)
 {
-    // Subtract offsets
-    nppsSub_32f_I_Ctx(reinterpret_cast<float*>(get(C_gpu)), get(data), 2 * total_length, streamContexts[stream_num]);
-
-    // Apply rotation
-    check_cublas_error(cublasGemmStridedBatchedEx(cublas_handles[stream_num],
-                                                  CUBLAS_OP_N,
-                                                  CUBLAS_OP_N,
-                                                  cal_mat_side, cal_mat_side, cal_mat_side,
-                                                  &alpha,
-                                                  A_gpu, CUDA_R_32F, cal_mat_side, cal_mat_size,
-                                                  get(data), CUDA_R_32F, cal_mat_side, cal_mat_size,
-                                                  &beta,
-                                                  get(data_calibrated), CUDA_R_32F, cal_mat_side,
-                                                  cal_mat_size,
-                                                  batch_count,
-                                                  CUBLAS_COMPUTE_32F_FAST_TF32,
-                                                  //                              CUBLAS_GEMM_ALGO13_TENSOR_OP);
-                                                  CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                       "cublas error in applyDownConversionCalibration");
+    auto sync_exec_policy = thrust::cuda::par.on(streams[stream_num]);
+    thrust::transform(sync_exec_policy, data.begin(), data.end(), data_calibrated.begin(), downconv_functor(a_ii, a_qi, a_qq, c_i, c_q));
 }
 
 // Applies the filter with the specified window to the data using FFT convolution
