@@ -23,6 +23,10 @@
     <CudaCompile Include="dsp.cu" />
     <CudaCompile Include="measurement.cu" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include="dsp.cu" />
+    <None Include="measurement.cu" />
+  </ItemGroup>
   <PropertyGroup Label="Globals">
     <ProjectGuid>{1AC83BBC-A038-4251-877B-D6837CAECDD5}</ProjectGuid>
     <RootNamespace>NonstationaryG1</RootNamespace>
@@ -72,7 +76,7 @@
       <Optimization>Disabled</Optimization>
       <PreprocessorDefinitions>WIN32;WIN64;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <LanguageStandard>stdcpplatest</LanguageStandard>
-      <AdditionalIncludeDirectories>C:\Users\labiks\anaconda3\envs\Measurement\include;C:\Users\labiks\anaconda3\envs\Measurement\include\pybind11-global;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\miniconda3\envs\Measurement\include;D:\miniconda3\envs\Measurement\include\pybind11-global;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
       <AdditionalOptions>/favor:INTEL64 %(AdditionalOptions)</AdditionalOptions>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
@@ -98,7 +102,7 @@
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <PreprocessorDefinitions>WIN32;WIN64;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <LanguageStandard>stdcpplatest</LanguageStandard>
-      <AdditionalIncludeDirectories>C:\Users\labiks\anaconda3\envs\Measurement\include;C:\Users\labiks\anaconda3\envs\Measurement\include\pybind11-global;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\miniconda3\envs\Measurement\include;D:\miniconda3\envs\Measurement\include\pybind11-global;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>/favor:INTEL64 %(AdditionalOptions)</AdditionalOptions>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
     </ClCompile>

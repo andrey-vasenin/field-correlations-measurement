@@ -428,7 +428,7 @@ void dsp::calculateG1(int stream_num)
 }
 
 // Returns the average value
-void dsp::getCorrelator(std::vector<std::complex<float>> &result)
+void dsp::getCorrelator(stdvec_c &result)
 {
     this->handleError(cudaDeviceSynchronize());
     for (int i = 1; i < num_streams; i++)
@@ -438,7 +438,7 @@ void dsp::getCorrelator(std::vector<std::complex<float>> &result)
 }
 
 // Returns the cumulative power
-void dsp::getCumulativePower(std::vector<std::complex<float>> &result)
+void dsp::getCumulativePower(stdvec_c &result)
 {
     this->handleError(cudaDeviceSynchronize());
     for (int i = 1; i < num_streams; i++)
@@ -448,7 +448,7 @@ void dsp::getCumulativePower(std::vector<std::complex<float>> &result)
 }
 
 // Returns the cumulative field
-void dsp::getCumulativeField(std::vector<std::complex<float>> &result)
+void dsp::getCumulativeField(stdvec_c &result)
 {
     this->handleError(cudaDeviceSynchronize());
     for (int i = 1; i < num_streams; i++)
@@ -476,24 +476,18 @@ int dsp::getOutSize()
     return out_size;
 }
 
-// Get mininimal and maximal values from an array for the debug purposes
-void dsp::getMinMax(Npp32f *data, int stream_num)
-{
-    nppsMinMax_32f_Ctx(data, 2 * total_length, minfield, maxfield, minmaxbuffer, streamContexts[stream_num]);
-}
-
 void dsp::setAmplitude(int ampl)
 {
     scale = Npp32fc{static_cast<float>(ampl) / 128.f, 0.f};
 }
 
-void dsp::setSubtractionTrace(std::vector<std::complex<float>> &trace)
+void dsp::setSubtractionTrace(stdvec_c &trace)
 {
     this->handleError(cudaMemcpy((void *)subtraction_trace, (void *)trace.data(),
                                  total_length * sizeof(Npp32fc), cudaMemcpyHostToDevice));
 }
 
-void dsp::getSubtractionTrace(std::vector<std::complex<float>> &trace)
+void dsp::getSubtractionTrace(stdvec_c &trace)
 {
     this->handleError(cudaMemcpy((void *)trace.data(), (void *)subtraction_trace,
                                  total_length * sizeof(Npp32fc), cudaMemcpyDeviceToHost));

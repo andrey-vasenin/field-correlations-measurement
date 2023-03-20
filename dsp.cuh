@@ -23,6 +23,8 @@ typedef thrust::device_vector<std::complex<float>> gpuvec_c;
 typedef thrust::host_vector<std::complex<float>> hostvec_c;
 typedef thrust::device_vector<Npp8s> gpubuf;
 typedef thrust::host_vector<Npp8s, thrust::cuda::experimental::pinned_allocator<Npp8s>> hostbuf;
+typedef std::vector<float> stdvec;
+typedef std::vector<std::complex<float>> stdvec_c;
 
 template <typename T>
 inline T *get(thrust::device_vector<T> vec)
@@ -125,17 +127,17 @@ public:
 
     void compute(const char *buffer);
 
-    void getCumulativePower(std::vector<std::complex<float>> &result);
+    void getCumulativePower(stdvec_c &result);
 
-    void getCumulativeField(std::vector<std::complex<float>> &result);
+    void getCumulativeField(stdvec_c &result);
 
-    void getCorrelator(std::vector<std::complex<float>> &result);
+    void getCorrelator(stdvec_c &result);
 
     void setDownConversionCalibrationParameters(float r, float phi, float offset_i, float offset_q);
 
-    void setSubtractionTrace(std::vector<std::complex<float>> &trace);
+    void setSubtractionTrace(stdvec_c &trace);
 
-    void getSubtractionTrace(std::vector<std::complex<float>> &trace);
+    void getSubtractionTrace(stdvec_c &trace);
 
     void resetSubtractionTrace();
 
