@@ -12,8 +12,8 @@ using namespace pybind11::literals;
 
 namespace py = pybind11;
 
-PYBIND11_MODULE(nonstationaryg1, m) {
-    py::class_<Measurement>(m, "NonStationaryG1Measurer")
+PYBIND11_MODULE(CorrelatorsMeasurement, m) {
+    py::class_<Measurement>(m, "CorrelatorsMeasurer")
         .def(py::init<std::uintptr_t, unsigned long long, int, float>())
         .def("set_calibration", &Measurement::setCalibration)
         .def("set_firwin", &Measurement::setFirwin)
