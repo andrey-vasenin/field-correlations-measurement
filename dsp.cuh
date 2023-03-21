@@ -13,17 +13,21 @@
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 #include <thrust/complex.h>
+#include <thrust/mr/allocator.h>
+#include <thrust/system/cuda/memory_resource.h>
 
 const int num_streams = 4;
 const int cal_mat_size = 16;
 const int cal_mat_side = 4;
 
+typedef thrust::complex<float> tcf;
 typedef thrust::device_vector<float> gpuvec;
 typedef thrust::host_vector<float> hostvec;
-typedef thrust::device_vector<thrust::complex<float>> gpuvec_c;
-typedef thrust::host_vector<thrust::complex<float>> hostvec_c;
-typedef thrust::device_vector<Npp8s> gpubuf;
-typedef thrust::host_vector<Npp8s, thrust::cuda::experimental::pinned_allocator<Npp8s>> hostbuf;
+typedef thrust::device_vector<tcf> gpuvec_c;
+typedef thrust::host_vector<tcf> hostvec_c;
+typedef thrust::device_vector<char> gpubuf;
+typedef thrust::host_vector<char, thrust::mr::stateless_resource_allocator<char,
+    thrust::system::cuda::universal_host_pinned_memory_resource> > hostbuf;
 typedef std::vector<float> stdvec;
 typedef std::vector<std::complex<float>> stdvec_c;
 
@@ -64,12 +68,6 @@ class dsp
 
     int cnt = 0;
 
-    /* Min-max values */
-    Npp8u *minmaxbuffer;
-    Npp32f *minfield;
-    Npp32f *maxfield;
-    Npp32f min, max;
-
     /* Filtering window */
     gpuvec_c firwin;
 
@@ -87,7 +85,7 @@ private:
     int total_length; // batch_size * trace_length
     int out_size;
     int semaphore = 0;                           // for selecting the current stream
-    Npp32fc scale = Npp32fc{500.f / 128.f, 0.f}; // for conversion into mV
+    float scale = 500.f / 128.f; // for conversion into mV
 
     /* Streams' arrays */
     cudaStream_t streams[num_streams];
@@ -138,19 +136,19 @@ public:
         return max;
     }
 
-    void compute(const char *buffer);
+    void compute(const hostbuf & buffer);
 
-    void getCumulativePower(stdvec_c &result);
+    void getCumulativePower(hostvec &result);
 
-    void getCumulativeField(stdvec_c &result);
+    void getCumulativeField(hostvec_c &result);
 
-    void getCorrelator(stdvec_c &result);
+    void getCorrelator(hostvec_c &result);
 
     void setDownConversionCalibrationParameters(float r, float phi, float offset_i, float offset_q);
 
-    void setSubtractionTrace(stdvec_c &trace);
+    void setSubtractionTrace(hostvec_c &trace);
 
-    void getSubtractionTrace(stdvec_c &trace);
+    void getSubtractionTrace(hostvec_c &trace);
 
     void resetSubtractionTrace();
 
@@ -169,25 +167,23 @@ protected:
 
     void loadDataToGPUwithPitchAndOffset(const char *buffer, Npp8s *gpu_buf, size_t pitch, size_t offset, int stream_num);
 
-    void convertDataToMilivolts(gpuvec_c data, gpubuf gpu_buf, int stream_num);
+    void convertDataToMillivolts(gpuvec data, gpubuf gpu_buf, cudaStream_t& stream);
 
-    void downconvert(gpuvec_c data, int stream_num);
+    void downconvert(gpuvec_c data, cudaStream_t& stream);
 
-    void applyDownConversionCalibration(gpuvec_c &data, gpuvec_c &data_calibrated, int stream_num);
+    void applyDownConversionCalibration(gpuvec_c &data, gpuvec_c &data_calibrated, cudaStream_t& stream);
 
-    void addDataToOutput(Npp32f *data, Npp32f *output, int stream_num);
+    void addDataToOutput(gpuvec_c& data, gpuvec_c& output, cudaStream_t& stream);
 
-    void subtractDataFromOutput(Npp32f *data, Npp32f *output, int stream_num);
+    void subtractDataFromOutput(gpuvec_c& data, gpuvec_c& output, cudaStream_t& stream);
 
-    void applyFilter(gpuvec &data, const gpuvec &window, int stream_num);
+    void applyFilter(gpuvec_c &data, const gpuvec_c &window, int stream_num);
 
-    void getMinMax(Npp32f *data, int stream_num);
+    void calculateField(gpuvec_c data, gpuvec_c noise, gpuvec_c output, cudaStream_t& stream);
 
-    void calculateField(int stream_num);
+    void calculatePower(gpuvec_c data, gpuvec_c noise, gpuvec output, cudaStream_t& stream);
 
-    void calculatePower(int stream_num);
-
-    void calculateG1(int stream_num);
+    void calculateG1(gpuvec_c data, gpuvec_c noise, gpuvec_c output, cublasHandle_t &handle);
 };
 
 #endif // CPPMEASUREMENT_DSP_CUH

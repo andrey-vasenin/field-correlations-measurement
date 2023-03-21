@@ -16,6 +16,10 @@
 #include <cublas_v2.h>
 #include <cmath>
 #include <thrust/complex.h>
+#include <thrust/transform.h>
+#include <thrust/execution_policy.h>
+#include <thrust/sequence.h>
+
 
 inline void check_cufft_error(cufftResult cufft_err, std::string &&msg)
 {
@@ -146,81 +150,6 @@ void dsp::setFirwin(float cutoff_l, float cutoff_r, int oversampling)
     firwin = hFirwin;
 }
 
-// Initializes matrices and arrays required for down-conversion calibration with given parameters
-void dsp::setDownConversionCalibrationParameters(float r, float phi, float offset_i, float offset_q)
-{
-    // Filling A-matrix (4x4) in Fortran-style row order
-    float a_ii = 1;
-    float a_qi = std::tan(phi);
-    float a_qq = 1 / (r * std::cos(phi));
-    hostvec A_mat(cal_mat_size);
-    if (cal_mat_size == 4)
-    {
-        A_mat[0] = a_ii;
-        A_mat[1] = a_qi;
-        A_mat[2] = 0.f;
-        A_mat[3] = a_qq;
-    }
-    else
-    {
-        for (int i = 0; i < cal_mat_size; i++)
-            A_mat[i] = 0.f;
-        A_mat[0] = a_ii;
-        A_mat[1] = a_qi;
-        A_mat[5] = a_qq;
-        A_mat[10] = a_ii;
-        A_mat[11] = a_qi;
-        A_mat[15] = a_qq;
-    }
-
-    // Creating an array with repeated matrices
-    hostvec A_host(2 * total_length);
-    for (int i = 0; i < 2 * total_length; i += cal_mat_size)
-        for (int j = 0; j < cal_mat_size; j++)
-            A_host[i + j] = A_mat[j];
-
-    // Transferring it onto GPU memory
-    A_gpu = A_host;
-
-    // Estimating the number of matrix multiplications
-    batch_count = 2 * total_length / cal_mat_size;
-
-    // Filling the offsets array C_gpu
-    thrust::fill(C_gpu.begin(), C_gpu.end(), Npp32fc{offset_i, offset_q});
-
-    // cleaning
-    cudaDeviceSynchronize();
-}
-
-typedef thrust::complex<float> tcf;
-struct downconv_functor : thrust::unary_function<tcf, tcf>
-{
-    float a_qi, a_qq;
-    float c_i, c_q;
-
-    downconv_functor(float _a_qi, float _a_qq,
-                     float _c_i, float _c_q) : a_qi{_a_qi}, a_qq{_a_qq},
-                                               c_i{_c_i}, c_q{_c_q}
-    {
-    }
-
-    __host__ __device__ float operator()(tcf x)
-    {
-        return tcf(x.real() + c_i,
-                   a_qi * x.real() + a_qq * x.imag() + c_q);
-    }
-};
-
-void dsp::setDownConversionCalibrationParameters(float r, float phi,
-                                                 float offset_i, float offset_q)
-{
-    a_ii = 1;
-    a_qi = std::tan(phi);
-    a_qq = 1 / (r * std::cos(phi));
-    c_i = offset_i;
-    c_q = offset_q;
-}
-
 // Error handler
 void dsp::handleError(cudaError_t err)
 {
@@ -241,21 +170,59 @@ void dsp::setIntermediateFrequency(float frequency, int oversampling)
 {
     using namespace std::complex_literals;
     hostvec_c dcov_host(total_length);
-
     const float pi = std::acos(-1);
-
     float ovs = static_cast<float>(oversampling);
     float t = 0;
-
-    for (int j = 0; j < batch_size; j++)
-    {
-        for (int k = 0; k < trace_length; k++)
-        {
-            t = 0.8 * k * ovs;
-            dcov_host[j * trace_length + k] = std::exp(-2if * pi * frequency * t);
-        }
-    }
+    int k = 0;
+    thrust::generate(dcov_host.begin(), dcov_host.end(),
+        [&]() mutable {
+            k = (k < trace_length) ? k + 1 : 0;
+            t = 0.8 * ovs * k;
+            return std::exp(-2if* pi* frequency* t);
+        });
     downconversion_coeffs = dcov_host;
+}
+
+
+void dsp::downconvert(gpuvec_c data, cudaStream_t& stream)
+{
+    thrust::transform(thrust::cuda::par.on(stream), data.begin(), data.end(), downconversion_coeffs.begin(), data.begin(), thrust::multiplies());
+}
+
+struct downconv_functor : thrust::unary_function<tcf, tcf>
+{
+    float a_qi, a_qq;
+    float c_i, c_q;
+
+    downconv_functor(float _a_qi, float _a_qq,
+        float _c_i, float _c_q) : a_qi{ _a_qi }, a_qq{ _a_qq },
+        c_i{ _c_i }, c_q{ _c_q }
+    {
+    }
+
+    __host__ __device__
+        tcf operator()(tcf x)
+    {
+        return tcf(x.real() + c_i,
+            a_qi * x.real() + a_qq * x.imag() + c_q);
+    }
+};
+
+void dsp::setDownConversionCalibrationParameters(float r, float phi,
+    float offset_i, float offset_q)
+{
+    a_ii = 1;
+    a_qi = std::tan(phi);
+    a_qq = 1 / (r * std::cos(phi));
+    c_i = offset_i;
+    c_q = offset_q;
+}
+
+// Applies down-conversion calibration to traces
+void dsp::applyDownConversionCalibration(gpuvec_c& data, gpuvec_c& data_calibrated, cudaStream_t &stream)
+{
+    auto sync_exec_policy = thrust::cuda::par.on(stream);
+    thrust::transform(sync_exec_policy, data.begin(), data.end(), data_calibrated.begin(), downconv_functor(a_qi, a_qq, c_i, c_q));
 }
 
 char *dsp::getBufferPointer()
@@ -275,31 +242,28 @@ void dsp::resetOutput()
     }
 }
 
-void dsp::downconvert(gpuvec_c data, int stream_num)
-{
-    nppsMul_32fc_I_Ctx(to_Npp32fc_p(get(downconversion_coeffs)), to_Npp32fc_p(get(data)),
-        total_length, streamContexts[stream_num]);
-}
-
 void dsp::compute(const hostbuf &buffer)
 {
     const int stream_num = semaphore;
     switchStream();
     loadDataToGPUwithPitchAndOffset(buffer, gpu_buf[stream_num], pitch, trace1_start, stream_num);
     loadDataToGPUwithPitchAndOffset(buffer, gpu_buf2[stream_num], pitch, trace2_start, stream_num);
-    convertDataToMilivolts(data[stream_num], gpu_buf[stream_num], stream_num);
-    convertDataToMilivolts(noise[stream_num], gpu_buf2[stream_num], stream_num);
-    applyDownConversionCalibration(data[stream_num], data_calibrated[stream_num], stream_num);
-    applyDownConversionCalibration(noise[stream_num], noise_calibrated[stream_num], stream_num);
+    convertDataToMillivolts(data[stream_num], gpu_buf[stream_num], streams[stream_num]);
+    convertDataToMillivolts(noise[stream_num], gpu_buf2[stream_num], streams[stream_num]);
+    applyDownConversionCalibration(data[stream_num], data_calibrated[stream_num], streams[stream_num]);
+    applyDownConversionCalibration(noise[stream_num], noise_calibrated[stream_num], streams[stream_num]);
     applyFilter(data_calibrated[stream_num], firwin, stream_num);
     applyFilter(noise_calibrated[stream_num], firwin, stream_num);
-    downconvert(data_calibrated[stream_num], stream_num);
-    downconvert(noise_calibrated[stream_num], stream_num);
-    subtractDataFromOutput(subtraction_trace, data_calibrated[stream_num], stream_num);
+    downconvert(data_calibrated[stream_num], streams[stream_num]);
+    downconvert(noise_calibrated[stream_num], streams[stream_num]);
+    subtractDataFromOutput(subtraction_trace, data_calibrated[stream_num], streams[stream_num]);
 
-    calculateField(stream_num);
-    calculateG1(stream_num);
-    calculatePower(stream_num);
+    calculateField(data_calibrated[stream_num], noise_calibrated[stream_num],
+        field[stream_num], streams[stream_num]);
+    calculatePower(data_calibrated[stream_num], noise_calibrated[stream_num],
+        power[stream_num], streams[stream_num]);
+    calculateG1(data_calibrated[stream_num], noise_calibrated[stream_num],
+        out[stream_num], cublas_handles[stream_num]);
 }
 
 // This function uploads data from the specified section of a buffer array to the GPU memory
@@ -316,27 +280,27 @@ void dsp::loadDataToGPUwithPitchAndOffset(
                                   cudaMemcpyHostToDevice, streams[stream_num]));
 }
 
-// Converts bytes into 32-bit floats with mV dimensionality
-void dsp::convertDataToMilivolts(gpuvec data, gpubuf gpu_buf, int stream_num)
+struct millivolts_functor : thrust::unary_function<char, float>
 {
-    // convert from int8 to float32
-    check_npp_error(nppsConvert_8s32f_Ctx(get(gpu_buf), get(data),
-                                          2 * total_length, streamContexts[stream_num]),
-                    "error converting int8 to float32");
-    // multiply by a constant in order to convert into mV
-    check_npp_error(nppsMulC_32fc_I_Ctx(scale, reinterpret_cast<Npp32fc *>(get(data)), total_length, streamContexts[stream_num]),
-                    "error when scaling to mV");
-}
+    float scale;
 
-// Applies down-conversion calibration to traces
-void dsp::applyDownConversionCalibration(gpuvec_c &data, gpuvec_c &data_calibrated, int stream_num)
+    millivolts_functor(float s) : scale(s) {}
+
+    __host__ __device__ float operator()(char v)
+    {
+        return static_cast<float>(v) * scale;
+    }
+};
+
+// Converts bytes into 32-bit floats with mV dimensionality
+void dsp::convertDataToMillivolts(gpuvec data, gpubuf gpu_buf, cudaStream_t &stream)
 {
-    auto sync_exec_policy = thrust::cuda::par.on(streams[stream_num]);
-    thrust::transform(sync_exec_policy, data.begin(), data.end(), data_calibrated.begin(), downconv_functor(a_qi, a_qq, c_i, c_q));
+    thrust::transform(thrust::cuda::par.on(stream),
+        gpu_buf.begin(), gpu_buf.end(), data.begin(), millivolts_functor(scale));
 }
 
 // Applies the filter with the specified window to the data using FFT convolution
-void dsp::applyFilter(gpuvec &data, const gpuvec &window, int stream_num)
+void dsp::applyFilter(gpuvec_c &data, const gpuvec_c &window, int stream_num)
 {
     // Step 1. Take FFT of each segment
     cufftComplex *cufft_data = reinterpret_cast<cufftComplex *>(get(data));
@@ -356,59 +320,59 @@ void dsp::applyFilter(gpuvec &data, const gpuvec &window, int stream_num)
 }
 
 // Sums newly processed data with previous data for averaging
-void dsp::addDataToOutput(Npp32f *data, Npp32f *output, int stream_num)
+void dsp::addDataToOutput(gpuvec_c &data, gpuvec_c &output, cudaStream_t& stream)
 {
-    auto status = nppsAdd_32f_I_Ctx(data, output,
-                                    2 * total_length, streamContexts[stream_num]);
-    if (status != NPP_SUCCESS)
-    {
-        throw std::runtime_error("Error adding new data to previous #" + std::to_string(status));
-    }
+    transform(thrust::cuda::par.on(stream), output.begin(), output.end(), data.begin(),
+        output.begin(), thrust::plus<tcf>());
 }
 
 // Subtracts newly processed data from previous data
-void dsp::subtractDataFromOutput(Npp32f *data, Npp32f *output, int stream_num)
+void dsp::subtractDataFromOutput(gpuvec_c& data, gpuvec_c& output, cudaStream_t &stream)
 {
-    auto status = nppsSub_32f_I_Ctx(data, output,
-                                    2 * total_length, streamContexts[stream_num]);
-    if (status != NPP_SUCCESS)
-    {
-        throw std::runtime_error("Error adding new data to previous #" + std::to_string(status));
-    }
+    thrust::transform(thrust::cuda::par.on(stream), output.begin(), output.end(), data.begin(),
+        output.begin(), thrust::minus<tcf>());
 }
+
+
+struct field_functor : thrust::binary_function<thrust::tuple<tcf, tcf>, tcf, tcf>
+{
+    field_functor() {}
+
+    __host__ __device__ tcf operator()(thrust::tuple<tcf, tcf> x, tcf y)
+    {
+        return y + thrust::get<0>(x) - thrust::get<1>(x);
+    }
+};
 
 // Calculates the field from the data in the GPU memory
-void dsp::calculateField(int stream_num)
+void dsp::calculateField(gpuvec_c data, gpuvec_c noise, gpuvec_c output, cudaStream_t &stream)
 {
-    // Add signal field to the cumulative field
-    this->addDataToOutput(data_calibrated[stream_num], field[stream_num], stream_num);
-    // Subtract noise field from the cumulative field
-    this->subtractDataFromOutput(noise_calibrated[stream_num], field[stream_num], stream_num);
-    this->getMinMax(field[stream_num], stream_num);
+    thrust::transform(thrust::cuda::par.on(stream),
+        thrust::make_zip_iterator(data.begin(), noise.begin()),
+        thrust::make_zip_iterator(data.end(), noise.end()),
+        output.begin(), output.begin(), field_functor());
 }
+
+struct power_functor : thrust::binary_function<thrust::tuple<tcf, tcf>, float, float>
+{
+    power_functor() {}
+
+    __host__ __device__ float operator()(thrust::tuple<tcf, tcf> x, float y)
+    {
+        return y + thrust::norm(thrust::get<0>(x)) - thrust::norm(thrust::get<1>(x));
+    }
+};
 
 // Calculates the power from the data in the GPU memory
-void dsp::calculatePower(int stream_num)
+void dsp::calculatePower(gpuvec_c data, gpuvec_c noise, gpuvec output, cudaStream_t& stream)
 {
-    // Calculate squared signal
-    auto status = nppsSqr_32f_I_Ctx(data_calibrated[stream_num], 2 * total_length, streamContexts[stream_num]);
-    if (status != NPP_SUCCESS)
-    {
-        throw std::runtime_error("Error squaring data #" + std::to_string(status));
-    }
-    // Calculate squared noise
-    status = nppsSqr_32f_I_Ctx(noise_calibrated[stream_num], 2 * total_length, streamContexts[stream_num]);
-    if (status != NPP_SUCCESS)
-    {
-        throw std::runtime_error("Error squaring data #" + std::to_string(status));
-    }
-    // Add signal power to the cumulative power
-    this->addDataToOutput(data_calibrated[stream_num], power[stream_num], stream_num);
-    // Subtract noise power from the cumulative power
-    this->subtractDataFromOutput(noise_calibrated[stream_num], power[stream_num], stream_num);
+    thrust::transform(thrust::cuda::par.on(stream),
+        thrust::make_zip_iterator(data.begin(), noise.begin()),
+        thrust::make_zip_iterator(data.end(), noise.end()),
+        output.begin(), output.begin(), power_functor());
 }
 
-void dsp::calculateG1(int stream_num)
+void dsp::calculateG1(gpuvec_c data, gpuvec_c noise, gpuvec_c output, cublasHandle_t &handle)
 {
     using namespace std::string_literals;
 
@@ -416,55 +380,48 @@ void dsp::calculateG1(int stream_num)
     const float alpha_noise = -1; // this alpha multiplies the result to be added to the output
     const float beta = 1;
     // Compute correlation for the signal and add it to the output
-    auto cublas_status = cublasCherk(cublas_handles2[stream_num],
+    auto cublas_status = cublasCherk(handle,
                                      CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N, trace_length, batch_size,
-                                     &alpha_data, reinterpret_cast<cuComplex *>(data_calibrated[stream_num]), trace_length,
-                                     &beta, reinterpret_cast<cuComplex *>(out[stream_num]), trace_length);
+                                     &alpha_data, reinterpret_cast<cuComplex *>(get(data)), trace_length,
+                                     &beta, reinterpret_cast<cuComplex *>(get(output)), trace_length);
     // Check for errors
-    if (cublas_status != CUBLAS_STATUS_SUCCESS)
-    {
-        throw std::runtime_error("Error of rank-1 update (data) with code #"s + std::to_string(cublas_status));
-    }
+    check_cublas_error(cublas_status,
+        "Error of rank-1 update (data) with code #"s + std::to_string(cublas_status));
     // Compute correlation for the noise and subtract it from the output
-    cublas_status = cublasCherk(cublas_handles2[stream_num],
+    cublas_status = cublasCherk(handle,
                                 CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N, trace_length, batch_size,
-                                &alpha_noise, reinterpret_cast<cuComplex *>(noise_calibrated[stream_num]), trace_length,
-                                &beta, reinterpret_cast<cuComplex *>(out[stream_num]), trace_length);
+                                &alpha_noise, reinterpret_cast<cuComplex *>(get(noise)), trace_length,
+                                &beta, reinterpret_cast<cuComplex *>(get(output)), trace_length);
     // Check for errors
-    if (cublas_status != CUBLAS_STATUS_SUCCESS)
-    {
-        throw std::runtime_error("Error of rank-1 update (noise) with code #"s + std::to_string(cublas_status));
-    }
+    check_cublas_error(cublas_status,
+        "Error of rank-1 update (noise) with code #"s + std::to_string(cublas_status));
 }
 
 // Returns the average value
-void dsp::getCorrelator(stdvec_c &result)
+void dsp::getCorrelator(hostvec_c &result)
 {
     this->handleError(cudaDeviceSynchronize());
     for (int i = 1; i < num_streams; i++)
-        nppsAdd_32fc_I(out[i], out[0], out_size);
-    this->handleError(cudaMemcpy(result.data(), out[0],
-                                 out_size * sizeof(Npp32fc), cudaMemcpyDeviceToHost));
+        thrust::transform(out[i].begin(), out[i].end(), out[0].begin(), thrust::plus<tcf>());
+    result = out[0];
 }
 
 // Returns the cumulative power
-void dsp::getCumulativePower(stdvec_c &result)
+void dsp::getCumulativePower(hostvec &result)
 {
     this->handleError(cudaDeviceSynchronize());
     for (int i = 1; i < num_streams; i++)
-        nppsAdd_32f_I(power[i], power[0], 2 * total_length);
-    this->handleError(cudaMemcpy(result.data(), power[0],
-                                 2 * total_length * sizeof(Npp32f), cudaMemcpyDeviceToHost));
+        thrust::transform(power[i].begin(), power[i].end(), power[0].begin(), thrust::plus<float>());
+    result = power[0];
 }
 
 // Returns the cumulative field
-void dsp::getCumulativeField(stdvec_c &result)
+void dsp::getCumulativeField(hostvec_c &result)
 {
     this->handleError(cudaDeviceSynchronize());
     for (int i = 1; i < num_streams; i++)
-        nppsAdd_32f_I(field[i], field[0], 2 * total_length);
-    this->handleError(cudaMemcpy(result.data(), field[0],
-                                 2 * total_length * sizeof(Npp32f), cudaMemcpyDeviceToHost));
+        thrust::transform(field[i].begin(), field[i].end(), field[0].begin(), thrust::plus<tcf>());
+    result = field[0];
 }
 
 // Returns the useful length of the data in a segment
@@ -488,22 +445,20 @@ int dsp::getOutSize()
 
 void dsp::setAmplitude(int ampl)
 {
-    scale = Npp32fc{static_cast<float>(ampl) / 128.f, 0.f};
+    scale = static_cast<float>(ampl) / 128.f;
 }
 
-void dsp::setSubtractionTrace(stdvec_c &trace)
+void dsp::setSubtractionTrace(hostvec_c &trace)
 {
-    this->handleError(cudaMemcpy((void *)subtraction_trace, (void *)trace.data(),
-                                 total_length * sizeof(Npp32fc), cudaMemcpyHostToDevice));
+    subtraction_trace = trace;
 }
 
-void dsp::getSubtractionTrace(stdvec_c &trace)
+void dsp::getSubtractionTrace(hostvec_c &trace)
 {
-    this->handleError(cudaMemcpy((void *)trace.data(), (void *)subtraction_trace,
-                                 total_length * sizeof(Npp32fc), cudaMemcpyDeviceToHost));
+    trace = subtraction_trace;
 }
 
 void dsp::resetSubtractionTrace()
 {
-    nppsSet_32fc(Npp32fc{0.f, 0.f}, subtraction_trace, total_length);
+    thrust::fill(subtraction_trace.begin(), subtraction_trace.end(), 0.f);
 }
