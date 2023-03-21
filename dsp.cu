@@ -17,8 +17,12 @@
 #include <cmath>
 #include <thrust/complex.h>
 #include <thrust/transform.h>
+#include <thrust/tabulate.h>
 #include <thrust/execution_policy.h>
 #include <thrust/sequence.h>
+#include <thrust/for_each.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/zip_function.h>
 
 
 inline void check_cufft_error(cufftResult cufft_err, std::string &&msg)
@@ -168,21 +172,14 @@ void dsp::createBuffer(uint32_t size)
 
 void dsp::setIntermediateFrequency(float frequency, int oversampling)
 {
-    using namespace std::complex_literals;
-    hostvec_c dcov_host(total_length);
     const float pi = std::acos(-1);
     float ovs = static_cast<float>(oversampling);
-    float t = 0;
-    int k = 0;
-    thrust::generate(dcov_host.begin(), dcov_host.end(),
-        [&]() mutable {
-            k = (k < trace_length) ? k + 1 : 0;
-            t = 0.8 * ovs * k;
-            return std::exp(-2if* pi* frequency* t);
+    thrust::tabulate(downconversion_coeffs.begin(), downconversion_coeffs.end(),
+        [=] __device__ (int i) {
+            float t = 0.8 * ovs * static_cast<float>(i % trace_length);
+            return thrust::exp(tcf(0, -2 * pi * frequency * t));
         });
-    downconversion_coeffs = dcov_host;
 }
-
 
 void dsp::downconvert(gpuvec_c data, cudaStream_t& stream)
 {
@@ -334,42 +331,40 @@ void dsp::subtractDataFromOutput(gpuvec_c& data, gpuvec_c& output, cudaStream_t 
 }
 
 
-struct field_functor : thrust::binary_function<thrust::tuple<tcf, tcf>, tcf, tcf>
+struct field_functor
 {
-    field_functor() {}
-
-    __host__ __device__ tcf operator()(thrust::tuple<tcf, tcf> x, tcf y)
+    __host__ __device__
+    void operator()(const tcf& x, const tcf& y, tcf& z)
     {
-        return y + thrust::get<0>(x) - thrust::get<1>(x);
+        z += x - y;
     }
 };
 
 // Calculates the field from the data in the GPU memory
 void dsp::calculateField(gpuvec_c data, gpuvec_c noise, gpuvec_c output, cudaStream_t &stream)
 {
-    thrust::transform(thrust::cuda::par.on(stream),
-        thrust::make_zip_iterator(data.begin(), noise.begin()),
-        thrust::make_zip_iterator(data.end(), noise.end()),
-        output.begin(), output.begin(), field_functor());
+    thrust::for_each(thrust::cuda::par.on(stream),
+        thrust::make_zip_iterator(data.begin(), noise.begin(), output.begin()),
+        thrust::make_zip_iterator(data.end(), noise.end(), output.end()),
+        thrust::make_zip_function(field_functor()));
 }
 
-struct power_functor : thrust::binary_function<thrust::tuple<tcf, tcf>, float, float>
+struct power_functor
 {
-    power_functor() {}
-
-    __host__ __device__ float operator()(thrust::tuple<tcf, tcf> x, float y)
+    __host__ __device__
+    void operator()(const tcf& x, const tcf& y, float& z)
     {
-        return y + thrust::norm(thrust::get<0>(x)) - thrust::norm(thrust::get<1>(x));
+        z += thrust::norm(x) - thrust::norm(y);
     }
 };
 
 // Calculates the power from the data in the GPU memory
 void dsp::calculatePower(gpuvec_c data, gpuvec_c noise, gpuvec output, cudaStream_t& stream)
 {
-    thrust::transform(thrust::cuda::par.on(stream),
-        thrust::make_zip_iterator(data.begin(), noise.begin()),
-        thrust::make_zip_iterator(data.end(), noise.end()),
-        output.begin(), output.begin(), power_functor());
+    thrust::for_each(thrust::cuda::par.on(stream),
+        thrust::make_zip_iterator(data.begin(), noise.begin(), output.begin()),
+        thrust::make_zip_iterator(data.end(), noise.end(), output.end()),
+        thrust::make_zip_function(power_functor()));
 }
 
 void dsp::calculateG1(gpuvec_c data, gpuvec_c noise, gpuvec_c output, cublasHandle_t &handle)
