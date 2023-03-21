@@ -322,7 +322,7 @@ void dsp::applyFilter(gpuvec_c &data, const gpuvec_c &window, int stream_num)
 // Sums newly processed data with previous data for averaging
 void dsp::addDataToOutput(gpuvec_c &data, gpuvec_c &output, cudaStream_t& stream)
 {
-    transform(thrust::cuda::par.on(stream), output.begin(), output.end(), data.begin(),
+    thrust::transform(thrust::cuda::par.on(stream), output.begin(), output.end(), data.begin(),
         output.begin(), thrust::plus<tcf>());
 }
 
