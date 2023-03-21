@@ -15,23 +15,34 @@
 #include <complex>
 #include <cublas_v2.h>
 #include <cmath>
+#include <thrust/complex.h>
 
 inline void check_cufft_error(cufftResult cufft_err, std::string &&msg)
 {
+#ifdef NDEBUG
+
     if (cufft_err != CUFFT_SUCCESS)
         throw std::runtime_error(msg);
+
+#endif // NDEBUG
 }
 
 inline void check_cublas_error(cublasStatus_t err, std::string &&msg)
 {
+#ifdef NDEBUG
+
     if (err != CUBLAS_STATUS_SUCCESS)
         throw std::runtime_error(msg);
+
+#endif // NDEBUG
 }
 
 inline void check_npp_error(NppStatus err, std::string &&msg)
 {
+#ifdef NDEBUG
     if (err != NPP_SUCCESS)
         throw std::runtime_error(msg);
+#endif // NDEBUG
 }
 
 // DSP constructor
@@ -184,19 +195,18 @@ void dsp::setDownConversionCalibrationParameters(float r, float phi, float offse
 typedef thrust::complex<float> tcf;
 struct downconv_functor : thrust::unary_function<tcf, tcf>
 {
-    float a_ii, a_qi, a_qq;
+    float a_qi, a_qq;
     float c_i, c_q;
 
     downconv_functor(float _a_qi, float _a_qq,
-                     float _c_i, float _c_q) : a_ii{_a_ii}, a_qi{_a_qi},
-                                               a_qq{_a_qq},
+                     float _c_i, float _c_q) : a_qi{_a_qi}, a_qq{_a_qq},
                                                c_i{_c_i}, c_q{_c_q}
     {
     }
 
     __host__ __device__ float operator()(tcf x)
     {
-        return tcf(a_ii * x.real() + c_i,
+        return tcf(x.real() + c_i,
                    a_qi * x.real() + a_qq * x.imag() + c_q);
     }
 };
@@ -265,9 +275,10 @@ void dsp::resetOutput()
     }
 }
 
-void dsp::downconvert(gpuvec data, int stream_num)
+void dsp::downconvert(gpuvec_c data, int stream_num)
 {
-    nppsMul_32fc_I_Ctx(get(downconversion_coeffs), get(data), total_length, streamContexts[stream_num]);
+    nppsMul_32fc_I_Ctx(to_Npp32fc_p(get(downconversion_coeffs)), to_Npp32fc_p(get(data)),
+        total_length, streamContexts[stream_num]);
 }
 
 void dsp::compute(const hostbuf &buffer)
@@ -321,28 +332,27 @@ void dsp::convertDataToMilivolts(gpuvec data, gpubuf gpu_buf, int stream_num)
 void dsp::applyDownConversionCalibration(gpuvec_c &data, gpuvec_c &data_calibrated, int stream_num)
 {
     auto sync_exec_policy = thrust::cuda::par.on(streams[stream_num]);
-    thrust::transform(sync_exec_policy, data.begin(), data.end(), data_calibrated.begin(), downconv_functor(a_ii, a_qi, a_qq, c_i, c_q));
+    thrust::transform(sync_exec_policy, data.begin(), data.end(), data_calibrated.begin(), downconv_functor(a_qi, a_qq, c_i, c_q));
 }
 
 // Applies the filter with the specified window to the data using FFT convolution
-void dsp::applyFilter(gpuvec data, const gpuvec window, int stream_num)
+void dsp::applyFilter(gpuvec &data, const gpuvec &window, int stream_num)
 {
     // Step 1. Take FFT of each segment
     cufftComplex *cufft_data = reinterpret_cast<cufftComplex *>(get(data));
-    cufftExecC2C(plans[stream_num], cufft_data, cufft_data, CUFFT_FORWARD);
+    auto cufftstat = cufftExecC2C(plans[stream_num], cufft_data, cufft_data, CUFFT_FORWARD);
+    check_cufft_error(cufftstat, "Error executing cufft");
     // Step 2. Multiply each segment by a window
-    auto npp_status = nppsMul_32fc_I_Ctx(get(window), get(data), total_length, streamContexts[stream_num]);
-    if (npp_status != NPP_SUCCESS)
-    {
-        throw std::runtime_error("Error multiplying by window #" + std::to_string(npp_status));
-    }
+    auto npp_status = nppsMul_32fc_I_Ctx(to_Npp32fc_p(get(window)), to_Npp32fc_p(get(data)),
+        total_length, streamContexts[stream_num]);
+    check_npp_error(npp_status, "Error multiplying by window #" + std::to_string(npp_status));
     // Step 3. Take inverse FFT of each segment
     cufftExecC2C(plans[stream_num], cufft_data, cufft_data, CUFFT_INVERSE);
+    check_cufft_error(cufftstat, "Error executing cufft");
     // Step 4. Normalize the FFT for the output to equal the input
-    Npp32fc denominator;
-    denominator.re = (Npp32f)trace_length;
-    denominator.im = 0.f;
-    nppsDivC_32fc_I_Ctx(denominator, get(data), total_length, streamContexts[stream_num]);
+    Npp32fc denominator = { trace_length, 0.f };
+    npp_status = nppsDivC_32fc_I_Ctx(denominator, to_Npp32fc_p(get(data)), total_length, streamContexts[stream_num]);
+    check_npp_error(npp_status, "Error dividing by denomintator #" + std::to_string(npp_status));
 }
 
 // Sums newly processed data with previous data for averaging

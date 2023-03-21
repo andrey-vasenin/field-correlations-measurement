@@ -12,6 +12,7 @@
 #include <cublas_v2.h>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
+#include <thrust/complex.h>
 
 const int num_streams = 4;
 const int cal_mat_size = 16;
@@ -19,8 +20,8 @@ const int cal_mat_side = 4;
 
 typedef thrust::device_vector<float> gpuvec;
 typedef thrust::host_vector<float> hostvec;
-typedef thrust::device_vector<std::complex<float>> gpuvec_c;
-typedef thrust::host_vector<std::complex<float>> hostvec_c;
+typedef thrust::device_vector<thrust::complex<float>> gpuvec_c;
+typedef thrust::host_vector<thrust::complex<float>> hostvec_c;
 typedef thrust::device_vector<Npp8s> gpubuf;
 typedef thrust::host_vector<Npp8s, thrust::cuda::experimental::pinned_allocator<Npp8s>> hostbuf;
 typedef std::vector<float> stdvec;
@@ -30,6 +31,18 @@ template <typename T>
 inline T *get(thrust::device_vector<T> vec)
 {
     return thrust::raw_pointer_cast(&vec[0]);
+}
+
+template <typename T>
+inline Npp32fc* to_Npp32fc_p(T* v)
+{
+    return reinterpret_cast<Npp32fc*>(v);
+}
+
+template <typename T>
+inline Npp32f* to_Npp32f_p(T* v)
+{
+    return reinterpret_cast<Npp32f*>(v);
 }
 
 class dsp
@@ -166,7 +179,7 @@ protected:
 
     void subtractDataFromOutput(Npp32f *data, Npp32f *output, int stream_num);
 
-    void applyFilter(Npp32fc *data, const Npp32fc *window, int stream_num);
+    void applyFilter(gpuvec &data, const gpuvec &window, int stream_num);
 
     void getMinMax(Npp32f *data, int stream_num);
 
