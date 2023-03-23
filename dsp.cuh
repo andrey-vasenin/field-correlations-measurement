@@ -26,8 +26,9 @@ typedef thrust::host_vector<float> hostvec;
 typedef thrust::device_vector<tcf> gpuvec_c;
 typedef thrust::host_vector<tcf> hostvec_c;
 typedef thrust::device_vector<char> gpubuf;
-typedef thrust::host_vector<char, thrust::mr::stateless_resource_allocator<char,
+typedef thrust::host_vector<signed char, thrust::mr::stateless_resource_allocator<signed char,
     thrust::system::cuda::universal_host_pinned_memory_resource> > hostbuf;
+typedef hostbuf::iterator hostbuf_iter_t;
 typedef std::vector<float> stdvec;
 typedef std::vector<std::complex<float>> stdvec_c;
 
@@ -124,19 +125,7 @@ public:
 
     int getCounter() { return cnt; }
 
-    float getMin()
-    {
-        cudaMemcpy(&min, minfield, sizeof(Npp32f) * 1, cudaMemcpyDeviceToHost);
-        return min;
-    }
-
-    float getMax()
-    {
-        cudaMemcpy(&max, maxfield, sizeof(Npp32f) * 1, cudaMemcpyDeviceToHost);
-        return max;
-    }
-
-    void compute(const hostbuf & buffer);
+    void compute(const hostbuf::iterator& buffer);
 
     void getCumulativePower(hostvec &result);
 
@@ -156,7 +145,7 @@ public:
 
     void setIntermediateFrequency(float frequency, int oversampling);
 
-    char *getBufferPointer();
+    hostbuf::iterator getBuffer();
 
     void setAmplitude(int ampl);
 
@@ -165,7 +154,8 @@ protected:
 
     void switchStream() { semaphore = (semaphore < (num_streams - 1)) ? semaphore + 1 : 0; };
 
-    void loadDataToGPUwithPitchAndOffset(const char *buffer, Npp8s *gpu_buf, size_t pitch, size_t offset, int stream_num);
+    void loadDataToGPUwithPitchAndOffset(const hostbuf::iterator &buffer_iter,
+        gpubuf & gpu_buf, size_t pitch, size_t offset, int stream_num);
 
     void convertDataToMillivolts(gpuvec data, gpubuf gpu_buf, cudaStream_t& stream);
 

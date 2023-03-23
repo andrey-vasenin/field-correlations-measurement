@@ -21,8 +21,10 @@
 #include <thrust/execution_policy.h>
 #include <thrust/sequence.h>
 #include <thrust/for_each.h>
+#include <thrust/functional.h>
 #include <thrust/iterator/zip_iterator.h>
 #include <thrust/zip_function.h>
+#include <thrust/iterator/constant_iterator.h>
 
 
 inline void check_cufft_error(cufftResult cufft_err, std::string &&msg)
@@ -106,13 +108,6 @@ dsp::dsp(int len, int n, float part) : trace_length{(int)std::round((float)len *
                            "Error assigning a stream to a cuBLAS handle\n");
     }
     resetOutput();
-
-    // Allocate GPU memory for the minmax function
-    cudaMalloc((void **)(&minfield), sizeof(Npp32f) * 1);
-    cudaMalloc((void **)(&maxfield), sizeof(Npp32f) * 1);
-    int nBufferSize;
-    nppsMinMaxGetBufferSize_32f(2 * total_length, &nBufferSize);
-    cudaMalloc((void **)(&minmaxbuffer), nBufferSize);
 }
 
 // DSP destructor
@@ -130,10 +125,6 @@ dsp::~dsp()
         // Destroy GPU streams
         handleError(cudaStreamDestroy(streams[i]));
     }
-
-    cudaFree(minfield);
-    cudaFree(maxfield);
-    cudaFree(minmaxbuffer);
 
     cudaDeviceReset();
 }
@@ -186,12 +177,12 @@ void dsp::downconvert(gpuvec_c data, cudaStream_t& stream)
     thrust::transform(thrust::cuda::par.on(stream), data.begin(), data.end(), downconversion_coeffs.begin(), data.begin(), thrust::multiplies());
 }
 
-struct downconv_functor : thrust::unary_function<tcf, tcf>
+struct calibration_functor : thrust::unary_function<tcf, tcf>
 {
     float a_qi, a_qq;
     float c_i, c_q;
 
-    downconv_functor(float _a_qi, float _a_qq,
+    calibration_functor(float _a_qi, float _a_qq,
         float _c_i, float _c_q) : a_qi{ _a_qi }, a_qq{ _a_qq },
         c_i{ _c_i }, c_q{ _c_q }
     {
@@ -219,12 +210,12 @@ void dsp::setDownConversionCalibrationParameters(float r, float phi,
 void dsp::applyDownConversionCalibration(gpuvec_c& data, gpuvec_c& data_calibrated, cudaStream_t &stream)
 {
     auto sync_exec_policy = thrust::cuda::par.on(stream);
-    thrust::transform(sync_exec_policy, data.begin(), data.end(), data_calibrated.begin(), downconv_functor(a_qi, a_qq, c_i, c_q));
+    thrust::transform(sync_exec_policy, data.begin(), data.end(), data_calibrated.begin(), calibration_functor(a_qi, a_qq, c_i, c_q));
 }
 
-char *dsp::getBufferPointer()
+hostbuf::iterator dsp::getBuffer()
 {
-    return &buffer[0];
+    return buffer.begin();
 }
 
 // Fills with zeros the arrays for cumulative field and power in the GPU memory
@@ -239,12 +230,12 @@ void dsp::resetOutput()
     }
 }
 
-void dsp::compute(const hostbuf &buffer)
+void dsp::compute(const hostbuf::iterator &buffer_iter)
 {
     const int stream_num = semaphore;
     switchStream();
-    loadDataToGPUwithPitchAndOffset(buffer, gpu_buf[stream_num], pitch, trace1_start, stream_num);
-    loadDataToGPUwithPitchAndOffset(buffer, gpu_buf2[stream_num], pitch, trace2_start, stream_num);
+    loadDataToGPUwithPitchAndOffset(buffer_iter, gpu_buf[stream_num], pitch, trace1_start, stream_num);
+    loadDataToGPUwithPitchAndOffset(buffer_iter, gpu_buf2[stream_num], pitch, trace2_start, stream_num);
     convertDataToMillivolts(data[stream_num], gpu_buf[stream_num], streams[stream_num]);
     convertDataToMillivolts(noise[stream_num], gpu_buf2[stream_num], streams[stream_num]);
     applyDownConversionCalibration(data[stream_num], data_calibrated[stream_num], streams[stream_num]);
@@ -264,16 +255,15 @@ void dsp::compute(const hostbuf &buffer)
 }
 
 // This function uploads data from the specified section of a buffer array to the GPU memory
-void dsp::loadDataToGPUwithPitchAndOffset(
-    const hostbuf &buffer, gpubuf &gpu_buf,
-    size_t pitch, size_t offset, int stream_num)
+void dsp::loadDataToGPUwithPitchAndOffset(const hostbuf::iterator& buffer_iter,
+    gpubuf& gpu_buf, size_t pitch, size_t offset, int stream_num)
 {
     size_t width = 2 * size_t(trace_length) * sizeof(Npp8s);
     size_t src_pitch = 2 * pitch * sizeof(Npp8s);
     size_t dst_pitch = width;
     size_t shift = 2 * offset;
     handleError(cudaMemcpy2DAsync(get(gpu_buf), dst_pitch,
-                                  get(buffer) + shift, src_pitch, width, batch_size,
+                                  &*(buffer_iter + shift), src_pitch, width, batch_size,
                                   cudaMemcpyHostToDevice, streams[stream_num]));
 }
 
@@ -304,16 +294,15 @@ void dsp::applyFilter(gpuvec_c &data, const gpuvec_c &window, int stream_num)
     auto cufftstat = cufftExecC2C(plans[stream_num], cufft_data, cufft_data, CUFFT_FORWARD);
     check_cufft_error(cufftstat, "Error executing cufft");
     // Step 2. Multiply each segment by a window
-    auto npp_status = nppsMul_32fc_I_Ctx(to_Npp32fc_p(get(window)), to_Npp32fc_p(get(data)),
-        total_length, streamContexts[stream_num]);
-    check_npp_error(npp_status, "Error multiplying by window #" + std::to_string(npp_status));
+    thrust::transform(thrust::cuda::par.on(streams[stream_num]),
+        data.begin(), data.end(), window.begin(), data.begin(), thrust::multiplies<tcf>());
     // Step 3. Take inverse FFT of each segment
     cufftExecC2C(plans[stream_num], cufft_data, cufft_data, CUFFT_INVERSE);
     check_cufft_error(cufftstat, "Error executing cufft");
     // Step 4. Normalize the FFT for the output to equal the input
-    Npp32fc denominator = { trace_length, 0.f };
-    npp_status = nppsDivC_32fc_I_Ctx(denominator, to_Npp32fc_p(get(data)), total_length, streamContexts[stream_num]);
-    check_npp_error(npp_status, "Error dividing by denomintator #" + std::to_string(npp_status));
+    thrust::transform(thrust::cuda::par.on(streams[stream_num]),
+        data.begin(), data.end(), thrust::constant_iterator<tcf>(1.f / static_cast<float>(trace_length)),
+        data.begin(), thrust::multiplies<tcf>());
 }
 
 // Sums newly processed data with previous data for averaging
