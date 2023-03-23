@@ -17,6 +17,7 @@
   <ItemGroup>
     <ClInclude Include="digitizer.h" />
     <ClInclude Include="dsp.cuh" />
+    <ClInclude Include="dsp_functors.cuh" />
     <ClInclude Include="measurement.cuh" />
   </ItemGroup>
   <ItemGroup>

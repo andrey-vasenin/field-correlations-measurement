@@ -3,6 +3,7 @@
 //
 
 #include "dsp.cuh"
+#include "dsp_functors.cuh"
 #include <cstdio>
 #include <iostream>
 #include <string>
@@ -54,6 +55,54 @@ inline void check_npp_error(NppStatus err, std::string &&msg)
         throw std::runtime_error(msg);
 #endif // NDEBUG
 }
+
+template <typename Iterator>
+class strided_range
+{
+public:
+
+    typedef typename thrust::iterator_difference<Iterator>::type difference_type;
+
+    struct stride_functor : public thrust::unary_function<difference_type, difference_type>
+    {
+        difference_type stride;
+
+        stride_functor(difference_type stride)
+            : stride(stride) {}
+
+        __host__ __device__
+            difference_type operator()(const difference_type& i) const
+        {
+            return stride * i;
+        }
+    };
+
+    typedef typename thrust::counting_iterator<difference_type>                   CountingIterator;
+    typedef typename thrust::transform_iterator<stride_functor, CountingIterator> TransformIterator;
+    typedef typename thrust::permutation_iterator<Iterator, TransformIterator>     PermutationIterator;
+
+    // type of the strided_range iterator
+    typedef PermutationIterator iterator;
+
+    // construct strided_range for the range [first,last)
+    strided_range(Iterator first, Iterator last, difference_type stride)
+        : first(first), last(last), stride(stride) {}
+
+    iterator begin(void) const
+    {
+        return PermutationIterator(first, TransformIterator(CountingIterator(0), stride_functor(stride)));
+    }
+
+    iterator end(void) const
+    {
+        return begin() + ((last - first) + (stride - 1)) / stride;
+    }
+
+protected:
+    Iterator first;
+    Iterator last;
+    difference_type stride;
+};
 
 // DSP constructor
 dsp::dsp(int len, int n, float part) : trace_length{(int)std::round((float)len * part)}, // Length of a signal or noise trace
@@ -177,25 +226,6 @@ void dsp::downconvert(gpuvec_c data, cudaStream_t& stream)
     thrust::transform(thrust::cuda::par.on(stream), data.begin(), data.end(), downconversion_coeffs.begin(), data.begin(), thrust::multiplies());
 }
 
-struct calibration_functor : thrust::unary_function<tcf, tcf>
-{
-    float a_qi, a_qq;
-    float c_i, c_q;
-
-    calibration_functor(float _a_qi, float _a_qq,
-        float _c_i, float _c_q) : a_qi{ _a_qi }, a_qq{ _a_qq },
-        c_i{ _c_i }, c_q{ _c_q }
-    {
-    }
-
-    __host__ __device__
-        tcf operator()(tcf x)
-    {
-        return tcf(x.real() + c_i,
-            a_qi * x.real() + a_qq * x.imag() + c_q);
-    }
-};
-
 void dsp::setDownConversionCalibrationParameters(float r, float phi,
     float offset_i, float offset_q)
 {
@@ -267,23 +297,13 @@ void dsp::loadDataToGPUwithPitchAndOffset(const hostbuf::iterator& buffer_iter,
                                   cudaMemcpyHostToDevice, streams[stream_num]));
 }
 
-struct millivolts_functor : thrust::unary_function<char, float>
-{
-    float scale;
-
-    millivolts_functor(float s) : scale(s) {}
-
-    __host__ __device__ float operator()(char v)
-    {
-        return static_cast<float>(v) * scale;
-    }
-};
-
 // Converts bytes into 32-bit floats with mV dimensionality
-void dsp::convertDataToMillivolts(gpuvec data, gpubuf gpu_buf, cudaStream_t &stream)
+void dsp::convertDataToMillivolts(gpuvec_c data, gpubuf gpu_buf, cudaStream_t &stream)
 {
+    strided_range<gpubuf::iterator> channelI(gpu_buf.begin(), gpu_buf.end(), 2);
+    strided_range<gpubuf::iterator> channelQ(gpu_buf.begin() + 1, gpu_buf.end(), 2);
     thrust::transform(thrust::cuda::par.on(stream),
-        gpu_buf.begin(), gpu_buf.end(), data.begin(), millivolts_functor(scale));
+        channelI.begin(), channelI.end(), channelQ.begin(), data.begin(), millivolts_functor(scale));
 }
 
 // Applies the filter with the specified window to the data using FFT convolution
@@ -319,16 +339,6 @@ void dsp::subtractDataFromOutput(gpuvec_c& data, gpuvec_c& output, cudaStream_t 
         output.begin(), thrust::minus<tcf>());
 }
 
-
-struct field_functor
-{
-    __host__ __device__
-    void operator()(const tcf& x, const tcf& y, tcf& z)
-    {
-        z += x - y;
-    }
-};
-
 // Calculates the field from the data in the GPU memory
 void dsp::calculateField(gpuvec_c data, gpuvec_c noise, gpuvec_c output, cudaStream_t &stream)
 {
@@ -337,15 +347,6 @@ void dsp::calculateField(gpuvec_c data, gpuvec_c noise, gpuvec_c output, cudaStr
         thrust::make_zip_iterator(data.end(), noise.end(), output.end()),
         thrust::make_zip_function(field_functor()));
 }
-
-struct power_functor
-{
-    __host__ __device__
-    void operator()(const tcf& x, const tcf& y, float& z)
-    {
-        z += thrust::norm(x) - thrust::norm(y);
-    }
-};
 
 // Calculates the power from the data in the GPU memory
 void dsp::calculatePower(gpuvec_c data, gpuvec_c noise, gpuvec output, cudaStream_t& stream)

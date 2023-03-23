@@ -157,7 +157,7 @@ protected:
     void loadDataToGPUwithPitchAndOffset(const hostbuf::iterator &buffer_iter,
         gpubuf & gpu_buf, size_t pitch, size_t offset, int stream_num);
 
-    void convertDataToMillivolts(gpuvec data, gpubuf gpu_buf, cudaStream_t& stream);
+    void convertDataToMillivolts(gpuvec_c data, gpubuf gpu_buf, cudaStream_t& stream);
 
     void downconvert(gpuvec_c data, cudaStream_t& stream);
 
